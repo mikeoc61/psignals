@@ -1,0 +1,129 @@
+# =============================================================================
+# portfolio.example.yaml  —  SANITIZED TEMPLATE
+# -----------------------------------------------------------------------------
+# Copy this to portfolio.yaml and fill in your own holdings:
+#     cp portfolio.example.yaml portfolio.yaml
+#
+# portfolio.yaml is gitignored and must NEVER be committed to a public repo.
+# All values below are illustrative placeholders, not real positions.
+# =============================================================================
+
+meta:
+  base_currency: USD
+  total_value_ref: 1000000      # your total portfolio value (used for % math)
+  as_of: 2026-01-01
+
+# NOTE: keep exactly ONE constraints block. Duplicate top-level keys are
+# silently overwritten by the last one under YAML rules.
+constraints:
+  cash_floor_pct: 10            # minimum cash %, engine flags below this
+  earnings_blackout_days: 5     # suppress add/trim within N days of earnings
+  btc_complex_max_pct: 15       # cap on aggregate 'btc_complex' group weight
+
+# -----------------------------------------------------------------------------
+# positions schema
+#   role:        core | tactical | income
+#   mode:        allocation (drift-band rebalance) | signals (SMA/RSI zones)
+#   thesis:      free-text tag grouping the reason you hold it
+#   account:     free-text bucket label (e.g. taxable, ira, roth, 401k)
+#   target_weight: % of total portfolio
+#   max_weight:  optional hard cap (%)
+#   drift_band:  allocation mode only — +/- band before rebalance flag
+#   add_zone / trim_zone: signals mode — enable buy/sell signal generation
+#   group:       optional aggregation key (e.g. btc_complex, hard_assets)
+#   source:      'crypto' routes ticker through CRYPTO_MAP (BTC-USD, ETH-USD)
+#   earnings:    [Mon-DD-YYYY, ...] dates for blackout logic
+#   regime_watch / exit_trigger / notes: optional metadata
+# -----------------------------------------------------------------------------
+positions:
+
+  # --- allocation mode: rebalanced on drift band ---
+  VTI:
+    role: core
+    mode: allocation
+    thesis: us_broad
+    account: 401k
+    target_weight: 40.0
+    drift_band: 2.0
+
+  VXUS:
+    role: core
+    mode: allocation
+    thesis: intl_broad
+    account: 401k
+    target_weight: 15.0
+    drift_band: 1.5
+
+  # --- signals mode: SMA-distance add/trim zones ---
+  SPY:
+    role: core
+    mode: signals
+    thesis: us_lc
+    account: ira
+    target_weight: 10.0
+    max_weight: 12.0
+    add_zone: true
+    trim_zone: true
+
+  GLD:
+    role: core
+    mode: signals
+    thesis: hard_assets
+    group: hard_assets
+    account: taxable
+    target_weight: 5.0
+    add_zone: true
+    trim_zone: false
+
+  # --- crypto: source=crypto routes to *-USD via CRYPTO_MAP ---
+  BTC:
+    role: core
+    regime_watch: true
+    mode: signals
+    thesis: debasement
+    group: btc_complex
+    source: crypto
+    account: taxable
+    target_weight: 5.0
+    max_weight: 8.0
+    add_zone: true
+    trim_zone: false
+
+  # --- single-name tactical with earnings blackout ---
+  NVDA:
+    role: tactical
+    mode: signals
+    thesis: ai_infra
+    account: roth
+    target_weight: 2.0
+    max_weight: 3.0
+    add_zone: true
+    trim_zone: true
+    earnings: [Aug-27-2026, Nov-19-2026]
+
+  # --- income sleeve, drift-band managed ---
+  BND:
+    role: income
+    mode: allocation
+    thesis: short_duration
+    account: taxable
+    target_weight: 5.0
+    drift_band: 0.5
+
+# -----------------------------------------------------------------------------
+# unmonitored: held for accounting/% math but no daily signal (no price fetch)
+# -----------------------------------------------------------------------------
+unmonitored:
+  PRIVATE_FUND:
+    value_ref: 50000
+    account: ira
+    notes: private, no daily mark, quarterly manual update
+  CASH:
+    value_ref: 100000
+
+# -----------------------------------------------------------------------------
+# watchlist: not held, tracked for entry signals
+# -----------------------------------------------------------------------------
+watchlist:
+  SOXX: {thesis: ai_infra, entry_interest: true}
+  MU:   {thesis: ai_infra, entry_interest: true}

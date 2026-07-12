@@ -1,0 +1,38 @@
+# --- Private portfolio data: NEVER commit ---
+# Real holdings, weights, account labels, and total value live here.
+portfolio.yaml
+
+# Also ignore any personal variants
+portfolio.*.yaml
+!portfolio.example.yaml
+
+# Local overrides / scratch
+*.local.yaml
+/scratch/
+/out/
+*.ndjson
+
+# Price-history cache (if PSIGNALS_CACHE points inside the repo)
+.cache/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.uv/
+.python-version
+
+# --- Tooling / OS ---
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+.idea/
+.vscode/
