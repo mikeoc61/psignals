@@ -47,13 +47,19 @@ Price fetching is split by mutability:
   daily bars are immutable, so rolling anchors (SMA20/50/200, the percentile
   distribution) are computed from cache and only the added/stale tickers hit the
   network. This cuts yfinance call volume and rate-limit risk.
-- **Live price** is fetched fresh on every run (one batched 1-minute download)
-  and spliced onto each series as the current bar, so the price-driven signals
-  (`dist20`, `pctile20`, `rsi14`, `z20`, `ret21`) stay near-realtime (≤~2 min lag)
-  while the anchors ride on cached bars.
+- **Live price** is fetched fresh on every run (uncached) from Yahoo's *daily*
+  endpoint and spliced onto each series as the current forming bar, so the
+  price-driven signals (`dist20`, `pctile20`, `rsi14`, `z20`, `ret21`) refresh
+  while the anchors ride on cached bars. Freshness = Yahoo's quote delay
+  (~15 min for equities, near-real-time for crypto). The daily endpoint is used
+  deliberately: the 1-minute intraday endpoint is separately rate-limited and
+  returns empty for crypto (`BTC-USD`/`ETH-USD`) in large batches.
 
-If the live fetch fails for a ticker, it falls back to the cached last close and
-emits a `NOTE` so the degradation is visible.
+The overlay is hardened against transient failures: it retries the batch, pins
+yfinance's timezone cache to a stable path (avoids the intermittent SQLite
+`database is locked` error), and falls back to a per-ticker `fast_info` quote for
+any straggler. If a ticker still can't be refreshed it keeps the cached last
+close and emits a `NOTE`, so the degradation is visible and auditable.
 
 Cache location precedence: `PSIGNALS_CACHE` (explicit) → `XDG_CACHE_HOME/psignals`
 → `~/.cache/psignals`. It's a persistent disk cache by design — deterministic

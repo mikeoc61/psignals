@@ -95,38 +95,76 @@ def fetch_history(tickers, period=LOOKBACK, ttl=HISTORY_TTL, use_cache=True):
     return {t: c for t, c in out.items() if len(c) >= 60}
 
 
-def apply_live_prices(history):
-    """Splice a near-realtime last price onto each cached daily series.
+def _splice(close, last, last_dt):
+    """Overwrite the current bar or append a newer one; ignore stale quotes."""
+    anchor = close.index[-1].normalize()
+    if last_dt == anchor:
+        close.iloc[-1] = last
+    elif last_dt > anchor:
+        close.loc[last_dt] = last
 
-    One batched 1-min download; the last valid bar overwrites today's forming
-    daily bar (or appends a fresh point). Rolling anchors stay on cached bars;
-    only current-price-driven indicators refresh. Returns list of tickers that
-    could not be refreshed (kept at cached last close).
+
+def apply_live_prices(history, quote_period="5d", retries=2):
+    """Refresh each series' latest bar with a fresh (uncached) quote.
+
+    Uses Yahoo's DAILY endpoint -- the same one fetch_history uses and which is
+    reliable for crypto -- re-fetched uncached so intraday reruns pick up the
+    updated forming-bar close. The 1-minute intraday endpoint was dropped: it is
+    separately rate-limited and returns empty for crypto in large batches.
+    Freshness = Yahoo quote delay (~15 min equities, near-real-time crypto).
+
+    Hardening: retry the batch, pin yfinance's tz cache to a stable path (avoids
+    the 'database is locked' SQLite error), and fall back to a per-ticker
+    fast_info quote for any straggler. Returns tickers left on cached last close.
     """
+    import logging
     import yfinance as yf
+
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    try:
+        yf.set_tz_cache_location(str(CACHE_DIR / "yf-tz"))
+    except Exception:
+        pass
 
     if not history:
         return []
-    quotes = yf.download(
-        list(history), period="1d", interval="1m", progress=False, group_by="ticker"
-    )
-    today = pd.Timestamp(date.today())
-    missed = []
-    multi = len(history) > 1
-    for t, close in history.items():
+    tickers = list(history)
+    multi = len(tickers) > 1
+
+    data = None
+    for attempt in range(retries + 1):
         try:
-            q = quotes[t]["Close"] if multi else quotes["Close"]
-            last = float(q.dropna().iloc[-1])
-        except (KeyError, IndexError, ValueError):
+            data = yf.download(
+                tickers, period=quote_period, interval="1d",
+                auto_adjust=True, progress=False, group_by="ticker",
+            )
+            if data is not None and not data.empty:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5 * (attempt + 1))
+
+    missed = []
+    for t, close in history.items():
+        last = last_dt = None
+        try:
+            q = (data[t]["Close"] if multi else data["Close"]).dropna()
+            v = float(q.iloc[-1])
+            if v == v:  # not NaN
+                last, last_dt = v, q.index[-1].normalize()
+        except (KeyError, IndexError, ValueError, TypeError, AttributeError):
+            pass
+        if last is None:  # per-ticker fallback: lightweight quote endpoint
+            try:
+                v = float(yf.Ticker(t).fast_info.last_price)
+                if v == v:
+                    last, last_dt = v, pd.Timestamp(date.today())
+            except Exception:
+                pass
+        if last is None:
             missed.append(t)
             continue
-        if last != last:  # NaN guard
-            missed.append(t)
-            continue
-        if close.index[-1].normalize() == today:
-            close.iloc[-1] = last
-        else:
-            close.loc[today] = last
+        _splice(close, last, last_dt)
     return missed
 
 
