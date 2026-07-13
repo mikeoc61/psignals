@@ -228,13 +228,31 @@ def fetch_history(tickers, period=LOOKBACK, ttl=HISTORY_TTL, use_cache=True):
     return dict(out)
 
 
+def _naive_day(ts):
+    """Calendar-day Timestamp with tz stripped, for tz-safe comparison.
+
+    yfinance index tz-awareness varies by version/platform; the fast_info
+    fallback also yields a tz-naive today(). Comparing naive vs aware raises,
+    so reduce both sides to a bare normalized day before comparing.
+    """
+    ts = pd.Timestamp(ts)
+    if ts.tz is not None:
+        ts = ts.tz_localize(None)
+    return ts.normalize()
+
+
 def _splice(close, last, last_dt):
-    """Overwrite the current bar or append a newer one; ignore stale quotes."""
-    anchor = close.index[-1].normalize()
-    if last_dt == anchor:
+    """Overwrite the current bar or append a newer one; tz-robust, ignore stale."""
+    anchor = _naive_day(close.index[-1])
+    day = _naive_day(last_dt)
+    if day == anchor:
         close.iloc[-1] = last
-    elif last_dt > anchor:
-        close.loc[last_dt] = last
+    elif day > anchor:
+        idx_tz = getattr(close.index, "tz", None)
+        label = pd.Timestamp(day)
+        if idx_tz is not None:  # match the series' tz so the index stays uniform
+            label = label.tz_localize(idx_tz)
+        close.loc[label] = last
 
 
 def apply_live_prices(history, quote_period="5d", retries=2):
