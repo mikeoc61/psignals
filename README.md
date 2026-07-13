@@ -66,10 +66,31 @@ Cache location precedence: `PSIGNALS_CACHE` (explicit) → `XDG_CACHE_HOME/psign
 under cron (no `XDG_RUNTIME_DIR` dependency) and survives reboots.
 
 ```bash
-uv run psignals.py --no-cache   # force full history refetch
-uv run psignals.py --no-live    # skip overlay, use cached last close
+uv run psignals.py --no-cache          # force full history refetch
+uv run psignals.py --no-live           # skip overlay, use cached last close
+uv run psignals.py --no-lock           # skip the concurrency lock
+uv run psignals.py --lock-timeout 30   # wait N seconds for a concurrent run (default 120)
 PSIGNALS_CACHE=./.cache uv run psignals.py   # repo-local cache
 ```
+
+### Concurrency
+
+Runs are serialized with an advisory `fcntl` lock at `<cache>/psignals.lock`, so a
+scheduled run (OpenClaw, cron, systemd timer) and a manual run can't race the
+shared cache or yfinance's tz DB. A blocked run waits up to `--lock-timeout`
+seconds, then exits rather than corrupting state. The lock is tied to the open fd,
+so the OS releases it automatically if a run crashes — no stale-lock cleanup. On
+non-Unix platforms (no `fcntl`) locking is a transparent no-op.
+
+### Fetch resilience
+
+Both the history and live fetches retry on transient failures and pin yfinance's
+timezone cache to a stable path, defeating the intermittent SQLite
+`database is locked` error. Any ticker that drops from an otherwise-successful
+batch is retried individually — this specifically protects the **`SPY` benchmark**,
+whose loss would silently disable `RS21` for every name. If the benchmark still
+can't be fetched, a `NOTE` line reports that `RS21` is disabled, so the condition
+is auditable rather than a silent gap.
 
 ### Deployment notes
 

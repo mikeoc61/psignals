@@ -9,12 +9,18 @@
 # ///
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+
+try:
+    import fcntl  # Unix (Pi + macOS); locking degrades to a no-op if absent
+except ImportError:
+    fcntl = None
 
 import pandas as pd
 import yaml
@@ -31,6 +37,42 @@ CACHE_DIR = Path(
     or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "psignals"
 )
 HISTORY_TTL = 3600  # 60 min; closed daily bars are immutable
+
+
+@contextlib.contextmanager
+def run_lock(enabled=True, timeout=120):
+    """Serialize invocations that share this host's cache and yfinance tz DB.
+
+    An advisory fcntl lock tied to the open fd: the OS releases it automatically
+    if the process dies, so there is no stale-lock cleanup (unlike a PID file).
+    A blocked run waits up to `timeout` seconds, then exits rather than racing.
+    No-op when locking is disabled or fcntl is unavailable (non-Unix).
+    """
+    if not enabled or fcntl is None:
+        yield
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CACHE_DIR / "psignals.lock"
+    fh = open(lock_path, "w")
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise SystemExit(
+                        f"psignals: another run holds {lock_path} "
+                        f"(waited {timeout}s) — exiting to avoid a data race."
+                    )
+                time.sleep(0.5)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
 PCTILE_ADD_STRONG = 5
 PCTILE_ADD_WATCH = 10
 PCTILE_TRIM = 90
@@ -55,15 +97,63 @@ def _cache_path(ticker, period):
     return CACHE_DIR / f"{safe}__{period}.pkl"
 
 
+def _yf_prepare(yf):
+    """Quiet yfinance's logging and pin its tz cache to a stable path.
+
+    The tz/cookie cache is a SQLite DB; on the default path it intermittently
+    throws 'database is locked' (e.g. on the Pi), which silently drops tickers
+    from a batch. Pinning it under CACHE_DIR + serializing runs (run_lock) avoids
+    that. Idempotent, so both fetch paths can call it.
+    """
+    import logging
+
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    try:
+        yf.set_tz_cache_location(str(CACHE_DIR / "yf-tz"))
+    except Exception:
+        pass
+
+
+def _download_daily(yf, tickers, period, retries=2):
+    """yf.download on the daily endpoint with retry/backoff for transient locks."""
+    data = None
+    for attempt in range(retries + 1):
+        try:
+            data = yf.download(
+                tickers, period=period, interval="1d",
+                auto_adjust=True, progress=False, group_by="ticker",
+            )
+            if data is not None and not data.empty:
+                return data
+        except Exception:
+            pass
+        time.sleep(0.5 * (attempt + 1))
+    return data
+
+
+def _extract_close(data, ticker, multi):
+    """Pull a clean (NaN-dropped) close Series for one ticker, or None."""
+    if data is None:
+        return None
+    try:
+        s = (data[ticker]["Close"] if multi else data["Close"]).dropna()
+    except (KeyError, TypeError, AttributeError):
+        return None
+    return s if len(s) else None
+
+
 def fetch_history(tickers, period=LOOKBACK, ttl=HISTORY_TTL, use_cache=True):
     """Daily close history per ticker.
 
     Closed daily bars never change, so each ticker's 2y series is cached to disk
-    with a 60-min TTL. Only stale/missing tickers hit the network. Pass
-    use_cache=False to force a full refresh.
+    with a 60-min TTL. Only stale/missing tickers hit the network. The batch is
+    retried, and any ticker that drops from an otherwise-successful batch (the
+    SPY 'database is locked' symptom) is retried individually so the benchmark
+    isn't silently lost. Pass use_cache=False to force a full refresh.
     """
     import yfinance as yf
 
+    _yf_prepare(yf)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     now = time.time()
     out, stale = {}, []
@@ -77,20 +167,24 @@ def fetch_history(tickers, period=LOOKBACK, ttl=HISTORY_TTL, use_cache=True):
                 pass  # corrupt cache -> refetch
         stale.append(t)
 
+    def _store(t, close):
+        try:
+            close.to_pickle(_cache_path(t, period))
+        except Exception:
+            pass  # cache write is best-effort
+        out[t] = close
+
     if stale:
-        data = yf.download(
-            stale, period=period, auto_adjust=True, progress=False, group_by="ticker"
-        )
+        data = _download_daily(yf, stale, period)
         for t in stale:
-            try:
-                close = data[t]["Close"].dropna() if len(stale) > 1 else data["Close"].dropna()
-            except KeyError:
-                continue
-            try:
-                close.to_pickle(_cache_path(t, period))
-            except Exception:
-                pass  # cache write is best-effort
-            out[t] = close
+            close = _extract_close(data, t, len(stale) > 1)
+            if close is not None:
+                _store(t, close)
+        # per-ticker retry for stragglers dropped from the batch
+        for t in [t for t in stale if t not in out]:
+            close = _extract_close(_download_daily(yf, [t], period), t, False)
+            if close is not None:
+                _store(t, close)
 
     return {t: c for t, c in out.items() if len(c) >= 60}
 
@@ -117,43 +211,22 @@ def apply_live_prices(history, quote_period="5d", retries=2):
     the 'database is locked' SQLite error), and fall back to a per-ticker
     fast_info quote for any straggler. Returns tickers left on cached last close.
     """
-    import logging
     import yfinance as yf
 
-    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-    try:
-        yf.set_tz_cache_location(str(CACHE_DIR / "yf-tz"))
-    except Exception:
-        pass
-
+    _yf_prepare(yf)
     if not history:
         return []
-    tickers = list(history)
-    multi = len(tickers) > 1
-
-    data = None
-    for attempt in range(retries + 1):
-        try:
-            data = yf.download(
-                tickers, period=quote_period, interval="1d",
-                auto_adjust=True, progress=False, group_by="ticker",
-            )
-            if data is not None and not data.empty:
-                break
-        except Exception:
-            pass
-        time.sleep(0.5 * (attempt + 1))
+    multi = len(history) > 1
+    data = _download_daily(yf, list(history), quote_period, retries=retries)
 
     missed = []
     for t, close in history.items():
         last = last_dt = None
-        try:
-            q = (data[t]["Close"] if multi else data["Close"]).dropna()
-            v = float(q.iloc[-1])
+        s = _extract_close(data, t, multi)
+        if s is not None:
+            v = float(s.iloc[-1])
             if v == v:  # not NaN
-                last, last_dt = v, q.index[-1].normalize()
-        except (KeyError, IndexError, ValueError, TypeError, AttributeError):
-            pass
+                last, last_dt = v, s.index[-1].normalize()
         if last is None:  # per-ticker fallback: lightweight quote endpoint
             try:
                 v = float(yf.Ticker(t).fast_info.last_price)
@@ -356,71 +429,83 @@ def main():
                     help="ignore the history cache and force a full refetch")
     ap.add_argument("--no-live", action="store_true",
                     help="skip the live-price overlay (use cached last close)")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="do not serialize with other runs (skip the flock)")
+    ap.add_argument("--lock-timeout", type=int, default=120, metavar="SEC",
+                    help="max seconds to wait for a concurrent run before exiting (default 120)")
     args = ap.parse_args()
 
     positions, constraints, watchlist = load_config(args.config)
 
-    monitored = {
-        n: p for n, p in positions.items() if p.get("mode", "signals") == "signals"
-    }
-    ticker_map = {n: CRYPTO_MAP.get(n, n) for n in monitored}
-    watch_map = {n: CRYPTO_MAP.get(n, n) for n in watchlist}
-    fetch_set = set(ticker_map.values()) | set(watch_map.values()) | {BENCHMARK}
-    history = fetch_history(list(fetch_set), use_cache=not args.no_cache)
+    # Serialize the network/cache-touching work so a scheduled run (OpenClaw,
+    # cron, ...) and a manual run don't race the shared cache or yfinance tz DB.
+    with run_lock(enabled=not args.no_lock, timeout=args.lock_timeout):
+        monitored = {
+            n: p for n, p in positions.items() if p.get("mode", "signals") == "signals"
+        }
+        ticker_map = {n: CRYPTO_MAP.get(n, n) for n in monitored}
+        watch_map = {n: CRYPTO_MAP.get(n, n) for n in watchlist}
+        fetch_set = set(ticker_map.values()) | set(watch_map.values()) | {BENCHMARK}
+        history = fetch_history(list(fetch_set), use_cache=not args.no_cache)
 
-    live_missed = []
-    if not args.no_live:
-        live_missed = apply_live_prices(history)
+        live_missed = []
+        if not args.no_live:
+            live_missed = apply_live_prices(history)
 
-    bench_ret21 = None
-    market_stress = False
-    if BENCHMARK in history:
-        bench_ind = compute_indicators(history[BENCHMARK])
-        bench_ret21 = bench_ind.get("ret21")
-        z = bench_ind.get("z20")
-        market_stress = z is not None and z < MARKET_STRESS_Z20
-    constraints["_market_stress"] = market_stress
+        bench_ret21 = None
+        market_stress = False
+        if BENCHMARK in history:
+            bench_ind = compute_indicators(history[BENCHMARK])
+            bench_ret21 = bench_ind.get("ret21")
+            z = bench_ind.get("z20")
+            market_stress = z is not None and z < MARKET_STRESS_Z20
+        constraints["_market_stress"] = market_stress
 
-    all_flags = []
-    if market_stress:
-        all_flags.append(
-            {"ticker": BENCHMARK, "signal": "NOTE",
-             "reason": f"market stress (SPY z20 < {MARKET_STRESS_Z20}), trim flags suppressed"}
-        )
-    if live_missed:
-        reverse = {v: k for k, v in {**ticker_map, **watch_map}.items()}
-        for yft in live_missed:
-            name = reverse.get(yft)
-            if name is not None:
-                all_flags.append(
-                    {"ticker": name, "signal": "NOTE",
-                     "reason": "live price unavailable, using cached last close"}
-                )
-    n_neutral = 0
-    n_watch_neutral = 0
-    for group, mapping, is_watch in (
-        (monitored, ticker_map, False),
-        (watchlist, watch_map, True),
-    ):
-        for name, pos in group.items():
-            yft = mapping[name]
-            if yft not in history:
-                all_flags.append(
-                    {"ticker": name, "signal": "NOTE", "reason": "no price data"}
-                )
-                continue
-            ind = compute_indicators(history[yft])
-            if bench_ret21 is not None and ind.get("ret21") is not None:
-                ind["rs21"] = ind["ret21"] - bench_ret21
-            else:
-                ind["rs21"] = None
-            flags = evaluate(name, pos, ind, constraints, watch=is_watch)
-            if flags:
-                all_flags.extend(flags)
-            elif is_watch:
-                n_watch_neutral += 1
-            else:
-                n_neutral += 1
+        all_flags = []
+        if market_stress:
+            all_flags.append(
+                {"ticker": BENCHMARK, "signal": "NOTE",
+                 "reason": f"market stress (SPY z20 < {MARKET_STRESS_Z20}), trim flags suppressed"}
+            )
+        if bench_ret21 is None:
+            all_flags.append(
+                {"ticker": BENCHMARK, "signal": "NOTE",
+                 "reason": "benchmark unavailable, RS21 disabled for all names"}
+            )
+        if live_missed:
+            reverse = {v: k for k, v in {**ticker_map, **watch_map}.items()}
+            for yft in live_missed:
+                name = reverse.get(yft)
+                if name is not None:
+                    all_flags.append(
+                        {"ticker": name, "signal": "NOTE",
+                         "reason": "live price unavailable, using cached last close"}
+                    )
+        n_neutral = 0
+        n_watch_neutral = 0
+        for group, mapping, is_watch in (
+            (monitored, ticker_map, False),
+            (watchlist, watch_map, True),
+        ):
+            for name, pos in group.items():
+                yft = mapping[name]
+                if yft not in history:
+                    all_flags.append(
+                        {"ticker": name, "signal": "NOTE", "reason": "no price data"}
+                    )
+                    continue
+                ind = compute_indicators(history[yft])
+                if bench_ret21 is not None and ind.get("ret21") is not None:
+                    ind["rs21"] = ind["ret21"] - bench_ret21
+                else:
+                    ind["rs21"] = None
+                flags = evaluate(name, pos, ind, constraints, watch=is_watch)
+                if flags:
+                    all_flags.extend(flags)
+                elif is_watch:
+                    n_watch_neutral += 1
+                else:
+                    n_neutral += 1
 
     if args.json:
         for f in all_flags:
