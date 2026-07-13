@@ -2,9 +2,10 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "yfinance>=0.2.50",
-#     "pandas>=2.0",
-#     "pyyaml>=6.0",
+#     "yfinance==1.5.1",
+#     "pandas==3.0.3",
+#     "numpy==2.4.6",   # explicit + pinned; 2.4.6 installs on both 3.11 (Pi) and 3.13 (Mac)
+#     "pyyaml==6.0.2",
 # ]
 # ///
 

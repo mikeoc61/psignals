@@ -39,6 +39,25 @@ Ad-hoc SMA distances for arbitrary tickers:
 uv run sma_dist.py FBTC NVDA GLD
 ```
 
+### Reproducibility
+
+Direct dependencies are **pinned to exact versions** in the inline script
+metadata (`yfinance==1.5.1`, `pandas==3.0.3`, `numpy==2.4.6`, `pyyaml==6.0.2`),
+so uv resolves the same package set on every host. `numpy` is pinned explicitly
+(it's otherwise transitive) to `2.4.6`, which has wheels for both Python 3.11
+(the Pi) and 3.13 (the Mac) — `2.5.1` would break the Pi, since it requires
+Python ≥3.12. Python itself is left as `>=3.11`; uv provides a matching
+interpreter per host.
+
+To also freeze the *transitive* graph byte-for-byte, generate and commit a
+script lockfile:
+
+```bash
+uv lock --script psignals.py   # writes psignals.py.lock; commit it
+```
+
+Subsequent `uv run` calls then honor the lock on both hosts.
+
 ## Data caching
 
 Price fetching is split by mutability:
