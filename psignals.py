@@ -37,6 +37,7 @@ CACHE_DIR = Path(
     or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "psignals"
 )
 HISTORY_TTL = 3600  # 60 min; closed daily bars are immutable
+MIN_HISTORY_ROWS = 60  # a series shorter than this is invalid: never cache/serve it
 DEBUG = False  # set by --debug; surfaces yfinance errors and fetch attempts
 
 
@@ -183,41 +184,48 @@ def fetch_history(tickers, period=LOOKBACK, ttl=HISTORY_TTL, use_cache=True):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     now = time.time()
     out, stale = {}, []
+
+    def _valid(s):
+        return s is not None and len(s) >= MIN_HISTORY_ROWS
+
     for t in tickers:
         cp = _cache_path(t, period)
         if use_cache and cp.exists() and now - cp.stat().st_mtime < ttl:
             try:
-                out[t] = pd.read_pickle(cp)
-                continue
+                s = pd.read_pickle(cp)
+                if _valid(s):
+                    out[t] = s
+                    continue
+                _dbg(f"{t}: cached series too short ({len(s)} rows), ignoring + refetching")
             except Exception:
                 pass  # corrupt cache -> refetch
         stale.append(t)
 
     def _store(t, close):
+        """Cache + keep only valid-length series; never persist a short one."""
+        if not _valid(close):
+            _dbg(f"{t}: fetched series too short ({0 if close is None else len(close)} rows), skipping")
+            return False
         try:
             close.to_pickle(_cache_path(t, period))
         except Exception:
             pass  # cache write is best-effort
         out[t] = close
+        return True
 
     if stale:
         data = _download_daily(yf, stale, period)
         for t in stale:
-            close = _extract_close(data, t, len(stale) > 1)
-            if close is not None:
-                _store(t, close)
-        # per-ticker retry for stragglers dropped from the batch, then a
-        # different-code-path fallback (Ticker.history) as a last resort
+            _store(t, _extract_close(data, t, len(stale) > 1))
+        # per-ticker retry for stragglers, then a different-code-path fallback
         for t in [t for t in stale if t not in out]:
-            close = _extract_close(_download_daily(yf, [t], period), t, False)
-            if close is None:
-                close = _ticker_history_close(yf, t, period)
-            if close is not None:
-                _store(t, close)
-            else:
-                _dbg(f"{t}: unrecoverable, dropped from history")
+            if _store(t, _extract_close(_download_daily(yf, [t], period), t, False)):
+                continue
+            if _store(t, _ticker_history_close(yf, t, period)):
+                continue
+            _dbg(f"{t}: unrecoverable, dropped from history")
 
-    return {t: c for t, c in out.items() if len(c) >= 60}
+    return dict(out)
 
 
 def _splice(close, last, last_dt):

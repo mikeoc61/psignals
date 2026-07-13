@@ -46,7 +46,9 @@ Price fetching is split by mutability:
 - **Daily history (2y)** is cached per ticker with a **60-minute TTL**. Closed
   daily bars are immutable, so rolling anchors (SMA20/50/200, the percentile
   distribution) are computed from cache and only the added/stale tickers hit the
-  network. This cuts yfinance call volume and rate-limit risk.
+  network. This cuts yfinance call volume and rate-limit risk. Series are
+  length-validated on **both write and read** (min 60 rows), so a truncated fetch
+  can never poison the cache and a pre-existing short entry self-heals on next run.
 - **Live price** is fetched fresh on every run (uncached) from Yahoo's *daily*
   endpoint and spliced onto each series as the current forming bar, so the
   price-driven signals (`dist20`, `pctile20`, `rsi14`, `z20`, `ret21`) refresh
