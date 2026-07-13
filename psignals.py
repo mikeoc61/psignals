@@ -37,6 +37,7 @@ CACHE_DIR = Path(
     or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "psignals"
 )
 HISTORY_TTL = 3600  # 60 min; closed daily bars are immutable
+DEBUG = False  # set by --debug; surfaces yfinance errors and fetch attempts
 
 
 @contextlib.contextmanager
@@ -107,28 +108,53 @@ def _yf_prepare(yf):
     """
     import logging
 
-    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    logging.getLogger("yfinance").setLevel(logging.DEBUG if DEBUG else logging.CRITICAL)
     try:
         yf.set_tz_cache_location(str(CACHE_DIR / "yf-tz"))
     except Exception:
         pass
 
 
+def _dbg(msg):
+    if DEBUG:
+        print(f"[debug] {msg}", file=sys.stderr)
+
+
 def _download_daily(yf, tickers, period, retries=2):
-    """yf.download on the daily endpoint with retry/backoff for transient locks."""
+    """yf.download on the daily endpoint with retry/backoff for transient locks.
+
+    threads=False serializes the download: yfinance's default multi-threaded
+    fetch has all worker threads writing the same tz-cache SQLite DB at once,
+    which collides on slower I/O (the Pi's SD card) as 'database is locked' and
+    silently drops a ticker. Single-threaded fetch trades a little speed for
+    correctness; on a daily job the cost is negligible.
+    """
     data = None
     for attempt in range(retries + 1):
         try:
             data = yf.download(
                 tickers, period=period, interval="1d",
                 auto_adjust=True, progress=False, group_by="ticker",
+                threads=False,
             )
             if data is not None and not data.empty:
                 return data
-        except Exception:
-            pass
+            _dbg(f"download {tickers} attempt {attempt}: empty frame")
+        except Exception as e:
+            _dbg(f"download {tickers} attempt {attempt}: {type(e).__name__}: {e}")
         time.sleep(0.5 * (attempt + 1))
     return data
+
+
+def _ticker_history_close(yf, ticker, period):
+    """Last-resort single-ticker fetch via a different yfinance code path."""
+    try:
+        df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        s = df["Close"].dropna()
+        return s if len(s) else None
+    except Exception as e:
+        _dbg(f"Ticker.history({ticker}): {type(e).__name__}: {e}")
+        return None
 
 
 def _extract_close(data, ticker, multi):
@@ -180,11 +206,16 @@ def fetch_history(tickers, period=LOOKBACK, ttl=HISTORY_TTL, use_cache=True):
             close = _extract_close(data, t, len(stale) > 1)
             if close is not None:
                 _store(t, close)
-        # per-ticker retry for stragglers dropped from the batch
+        # per-ticker retry for stragglers dropped from the batch, then a
+        # different-code-path fallback (Ticker.history) as a last resort
         for t in [t for t in stale if t not in out]:
             close = _extract_close(_download_daily(yf, [t], period), t, False)
+            if close is None:
+                close = _ticker_history_close(yf, t, period)
             if close is not None:
                 _store(t, close)
+            else:
+                _dbg(f"{t}: unrecoverable, dropped from history")
 
     return {t: c for t, c in out.items() if len(c) >= 60}
 
@@ -433,7 +464,12 @@ def main():
                     help="do not serialize with other runs (skip the flock)")
     ap.add_argument("--lock-timeout", type=int, default=120, metavar="SEC",
                     help="max seconds to wait for a concurrent run before exiting (default 120)")
+    ap.add_argument("--debug", action="store_true",
+                    help="surface yfinance errors and per-ticker fetch attempts on stderr")
     args = ap.parse_args()
+
+    global DEBUG
+    DEBUG = args.debug
 
     positions, constraints, watchlist = load_config(args.config)
 

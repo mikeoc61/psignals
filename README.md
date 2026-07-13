@@ -70,6 +70,7 @@ uv run psignals.py --no-cache          # force full history refetch
 uv run psignals.py --no-live           # skip overlay, use cached last close
 uv run psignals.py --no-lock           # skip the concurrency lock
 uv run psignals.py --lock-timeout 30   # wait N seconds for a concurrent run (default 120)
+uv run psignals.py --debug             # surface yfinance errors + per-ticker fetch attempts
 PSIGNALS_CACHE=./.cache uv run psignals.py   # repo-local cache
 ```
 
@@ -84,13 +85,19 @@ non-Unix platforms (no `fcntl`) locking is a transparent no-op.
 
 ### Fetch resilience
 
-Both the history and live fetches retry on transient failures and pin yfinance's
-timezone cache to a stable path, defeating the intermittent SQLite
-`database is locked` error. Any ticker that drops from an otherwise-successful
-batch is retried individually — this specifically protects the **`SPY` benchmark**,
-whose loss would silently disable `RS21` for every name. If the benchmark still
-can't be fetched, a `NOTE` line reports that `RS21` is disabled, so the condition
-is auditable rather than a silent gap.
+Fetches run **single-threaded** (`threads=False`). yfinance's default
+multi-threaded download has all worker threads writing the same tz-cache SQLite
+DB at once; on slower I/O (a Pi's SD card) those writes collide as
+`database is locked` and silently drop a ticker — classically `SPY`, whose loss
+disables `RS21` for every name. Serializing the fetch removes the race; on a
+daily job the speed cost is negligible.
+
+Belt-and-suspenders on top of that: both fetches retry on transient failures,
+pin yfinance's tz cache to a stable path, and fall back per-ticker — first to an
+individual download, then to `Ticker.history` (a different code path). If a
+ticker still can't be fetched it's dropped with a `NOTE`; a missing benchmark
+reports `RS21 disabled` so the gap is auditable, never silent. Run with `--debug`
+to surface the underlying yfinance errors and per-ticker fetch attempts on stderr.
 
 ### Deployment notes
 
