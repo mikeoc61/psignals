@@ -86,9 +86,50 @@ RS21_FLOOR_PCT = -15.0
 MARKET_STRESS_Z20 = -2.0
 
 
+def _read_env_file(path):
+    """Minimal .env parser: KEY=VALUE lines, '#' comments, optional 'export '
+    prefix, optional surrounding quotes. No interpolation, no dependencies."""
+    env = {}
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return env
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip("'\"")
+        if key:
+            env[key] = val
+    return env
+
+
+def resolve_portfolio_path(cli_arg):
+    """Portfolio config precedence (mirrors PSIGNALS_CACHE: explicit -> default):
+      1. config path given on the command line
+      2. PSIGNALS_PORTFOLIO in the process environment
+      3. PSIGNALS_PORTFOLIO in ~/.env
+      4. ./portfolio.yaml (CWD)
+    Returns (path, source_label)."""
+    if cli_arg:
+        return Path(cli_arg).expanduser(), "command line"
+    env_val = os.environ.get("PSIGNALS_PORTFOLIO")
+    if env_val:
+        return Path(env_val).expanduser(), "PSIGNALS_PORTFOLIO (environment)"
+    file_val = _read_env_file(Path.home() / ".env").get("PSIGNALS_PORTFOLIO")
+    if file_val:
+        return Path(file_val).expanduser(), "PSIGNALS_PORTFOLIO (~/.env)"
+    return Path("portfolio.yaml"), "default (CWD)"
+
+
 def load_config(path):
     with open(path) as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"expected a YAML mapping at top level, got {type(cfg).__name__}")
     positions = cfg.get("positions", {})
     constraints = cfg.get("constraints", {})
     watchlist = cfg.get("watchlist", {}) or {}
@@ -481,7 +522,9 @@ def format_briefing(all_flags, n_neutral, group_lines, n_watch_neutral=0):
 
 def main():
     ap = argparse.ArgumentParser(description="Portfolio SMA-distance signal engine v0.1.1")
-    ap.add_argument("config", nargs="?", default="portfolio.yaml")
+    ap.add_argument("config", nargs="?", default=None,
+                    help="portfolio yaml path (overrides PSIGNALS_PORTFOLIO env var and ~/.env; "
+                         "default: ./portfolio.yaml)")
     ap.add_argument("--json", action="store_true", help="emit NDJSON instead of text")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore the history cache and force a full refetch")
@@ -498,7 +541,21 @@ def main():
     global DEBUG
     DEBUG = args.debug
 
-    positions, constraints, watchlist = load_config(args.config)
+    config_path, config_source = resolve_portfolio_path(args.config)
+    # Path line goes to stderr under --json so the NDJSON stream stays parseable.
+    print(f"portfolio: {config_path.resolve()} [{config_source}]",
+          file=sys.stderr if args.json else sys.stdout)
+    if not config_path.is_file():
+        sys.exit(
+            f"error: portfolio config not found: {config_path.resolve()} [{config_source}]\n"
+            "searched: command line arg -> PSIGNALS_PORTFOLIO (environment) -> "
+            "PSIGNALS_PORTFOLIO (~/.env) -> ./portfolio.yaml\n"
+            "hint: cp portfolio.example.yaml portfolio.yaml, or set PSIGNALS_PORTFOLIO"
+        )
+    try:
+        positions, constraints, watchlist = load_config(config_path)
+    except (yaml.YAMLError, ValueError, OSError) as e:
+        sys.exit(f"error: failed to load {config_path.resolve()}: {e}")
 
     # Serialize the network/cache-touching work so a scheduled run (OpenClaw,
     # cron, ...) and a manual run don't race the shared cache or yfinance tz DB.

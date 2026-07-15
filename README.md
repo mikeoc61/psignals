@@ -33,6 +33,29 @@ uv run psignals.py path/to/cfg.yaml
 uv run psignals.py --json          # NDJSON output instead of text
 ```
 
+### Config resolution
+
+Portfolio config precedence (mirrors the cache: explicit → default):
+
+1. path given on the command line
+2. `PSIGNALS_PORTFOLIO` in the process environment
+3. `PSIGNALS_PORTFOLIO` in `~/.env` (minimal parser: `KEY=VALUE`, `#` comments,
+   optional `export` prefix and quotes, `~` expansion)
+4. `./portfolio.yaml` (CWD)
+
+The `~/.env` tier makes the script CWD-independent — a scheduled run (cron,
+OpenClaw) resolves the same config no matter where it's launched from:
+
+```bash
+echo 'PSIGNALS_PORTFOLIO=~/projects/psignals/portfolio.yaml' >> ~/.env
+```
+
+Every run prints the resolved absolute path and which tier supplied it
+(`portfolio: /path/to/portfolio.yaml [PSIGNALS_PORTFOLIO (~/.env)]`) — on
+stdout in text mode, on stderr under `--json` so the NDJSON stream stays
+parseable. A missing, unreadable, or malformed config exits with a one-line
+error naming the path and source tier (no traceback), exit code 1.
+
 Ad-hoc SMA distances for arbitrary tickers:
 
 ```bash
